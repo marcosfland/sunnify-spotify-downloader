@@ -935,3 +935,90 @@ class TestResilientExtraction:
                 api._cached_token = session_data.get("accessToken")
                 break
         assert api._cached_token == "tok_flat"
+
+
+class TestSpclientTokenHandling:
+    """The spclient fallback decides whether a >100-track playlist comes back
+    whole, so its token must be refreshed and its failures must be visible."""
+
+    BODY = {"length": 2, "contents": {"items": [{"uri": "spotify:track:a"}]}}
+
+    @staticmethod
+    def _resp(status, body=None):
+        return type(
+            "R", (), {"status_code": status, "json": staticmethod(lambda: body or {})}
+        )()
+
+    def _api(self, responses):
+        api = SpotifyEmbedAPI()
+        api._cached_token = "old"
+        calls: list[str] = []
+
+        def get(_url, headers=None, **_kw):
+            calls.append(headers["Authorization"])
+            return responses.pop(0)
+
+        api._session.get = get  # type: ignore[assignment]
+        return api, calls
+
+    def test_unknown_expiry_trusts_the_token(self):
+        api = SpotifyEmbedAPI()
+        api._cached_token = "tok"
+        api._fetch_embed_data = lambda _u: (_ for _ in ()).throw(  # type: ignore[assignment]
+            AssertionError("must not refetch the embed page")
+        )
+        assert api._get_access_token("PL") == "tok"
+
+    def test_expired_token_is_refreshed_before_use(self):
+        api = SpotifyEmbedAPI()
+        api._cached_token = "stale"
+        api._token_expiry = 1.0  # long past
+
+        def refetch(_url):
+            api._cached_token = "fresh"
+            api._token_expiry = 0
+            return {}
+
+        api._fetch_embed_data = refetch  # type: ignore[assignment]
+        assert api._get_access_token("PL") == "fresh"
+
+    def test_401_refreshes_once_and_retries(self):
+        api, calls = self._api([self._resp(401), self._resp(200, self.BODY)])
+
+        def refetch(_url):
+            api._cached_token = "new"
+            return {}
+
+        api._fetch_embed_data = refetch  # type: ignore[assignment]
+        assert api._spclient_playlist("PL", timeout=5) == self.BODY
+        assert calls == ["Bearer old", "Bearer new"]
+
+    def test_second_401_gives_up_instead_of_looping(self):
+        api, calls = self._api([self._resp(401), self._resp(401)])
+        api._fetch_embed_data = lambda _u: {}  # type: ignore[assignment]
+        api._cached_token = "old"
+        # refresh leaves the token cleared, so the retry has nothing to send
+        assert api._spclient_playlist("PL", timeout=5) is None
+        assert len(calls) == 1
+
+    def test_non_200_logs_and_returns_none(self, caplog):
+        api, _ = self._api([self._resp(500)])
+        with caplog.at_level("WARNING", logger="sunnify.api"):
+            assert api._spclient_playlist("PL", timeout=5) is None
+        assert "HTTP 500" in caplog.text
+
+    def test_truncation_is_logged_when_spclient_unavailable(self, caplog):
+        api = SpotifyEmbedAPI()
+        tracks = [
+            {"uri": f"spotify:track:t{i}", "title": f"T{i}", "subtitle": "A", "duration": 1}
+            for i in range(100)
+        ]
+        api._fetch_embed_data = lambda _u: {  # type: ignore[assignment]
+            "props": {"pageProps": {"state": {"data": {"entity": {"trackList": tracks}}}}}
+        }
+        api._cached_token = "tok"
+        api._session.get = lambda *_a, **_kw: self._resp(503)  # type: ignore[assignment]
+        with caplog.at_level("WARNING", logger="sunnify.api"):
+            out = list(api.iter_playlist_tracks("PL"))
+        assert len(out) == 100
+        assert "may have more than" in caplog.text

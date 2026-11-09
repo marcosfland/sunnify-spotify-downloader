@@ -295,15 +295,81 @@ class SpotifyEmbedAPI:
             f"Could not find entity in embed page. pageProps keys: {available_keys}"
         )
 
-    def _get_access_token(self, playlist_id: str) -> str | None:
-        """Get a valid access token, refreshing if needed."""
-        if self._cached_token and time.time() < self._token_expiry - 60:
+    # The embed page lists at most this many tracks; a playlist that fills it
+    # may be longer, so failing to reach spclient there means a truncated list.
+    _EMBED_TRACK_CAP = 100
+
+    def _token_is_fresh(self) -> bool:
+        """True while the cached token can be used.
+
+        An expiry of 0 means the page didn't say when it lapses; trust the
+        token and let a 401 trigger the refresh instead of refetching a page
+        on every call.
+        """
+        if not self._cached_token:
+            return False
+        return self._token_expiry == 0 or time.time() < self._token_expiry - 60
+
+    def _get_access_token(self, playlist_id: str, force: bool = False) -> str | None:
+        """Get a valid access token, refreshing from the embed page if needed.
+
+        `force` discards the cached token first (used after a 401). Returns
+        None when no token can be obtained; never raises, since the token is
+        only needed for the optional spclient fallback.
+        """
+        if force:
+            self._cached_token = None
+            self._token_expiry = 0
+        if self._token_is_fresh():
             return self._cached_token
 
-        # Fetch embed page to get fresh token
         url = self._EMBED_PLAYLIST_URL.format(playlist_id=playlist_id)
-        self._fetch_embed_data(url)
+        try:
+            self._fetch_embed_data(url)
+        except SpotifyDownAPIError as exc:
+            log.warning("could not refresh spotify access token: %s", exc)
+            return None
         return self._cached_token
+
+    def _spclient_playlist(self, playlist_id: str, timeout: int) -> dict | None:
+        """Fetch the spclient playlist document, or None (reason is logged).
+
+        Uses the cached token, refreshing it first when it has expired and
+        once more if spclient answers 401. Callers treat None as "fall back
+        to the embed data", so every failure path here says why in the log
+        instead of silently returning a truncated playlist.
+        """
+        if not self._cached_token:
+            log.debug("spclient skipped: embed page carried no access token")
+            return None
+
+        token = self._get_access_token(playlist_id)
+        url = self._SPCLIENT_URL.format(playlist_id=playlist_id)
+        for attempt in (1, 2):
+            if not token:
+                return None
+            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+            try:
+                resp = self._session.get(url, headers=headers, timeout=timeout)
+            except requests.RequestException as exc:
+                log.warning("spclient request failed: %s", exc)
+                return None
+            if resp.status_code == 401 and attempt == 1:
+                log.info("spclient rejected the token (401); refreshing once")
+                token = self._get_access_token(playlist_id, force=True)
+                continue
+            if resp.status_code != 200:
+                log.warning(
+                    "spclient returned HTTP %s for playlist %s", resp.status_code, playlist_id
+                )
+                return None
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                log.warning("spclient returned invalid JSON: %s", exc)
+                return None
+            return data if isinstance(data, dict) else None
+        return None
 
     def _embed_url_for(self, content_id: str, content_type: str) -> str:
         """Pick the embed page URL for a playlist or album.
@@ -351,17 +417,9 @@ class SpotifyEmbedAPI:
         # spclient refinement is playlist-only; albums ship the full trackList
         # in the embed payload, so there's nothing more to fetch.
         if content_type == "playlist":
-            try:
-                token = self._cached_token
-                if token:
-                    spclient_url = self._SPCLIENT_URL.format(playlist_id=playlist_id)
-                    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-                    resp = self._session.get(spclient_url, headers=headers, timeout=10)
-                    if resp.status_code == 200:
-                        spc_data = resp.json()
-                        track_count = spc_data.get("length", track_count)
-            except Exception:
-                pass  # Fall back to embed count
+            spc_data = self._spclient_playlist(playlist_id, timeout=10)
+            if spc_data:
+                track_count = spc_data.get("length", track_count)
 
         return PlaylistInfo(
             name=str(name),
@@ -436,19 +494,17 @@ class SpotifyEmbedAPI:
             return
 
         # Check if there are more tracks via spclient
-        token = self._cached_token
-        if not token:
-            return
-
         try:
-            spclient_url = self._SPCLIENT_URL.format(playlist_id=playlist_id)
-            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-            resp = self._session.get(spclient_url, headers=headers, timeout=30)
-
-            if resp.status_code != 200:
+            spc_data = self._spclient_playlist(playlist_id, timeout=30)
+            if spc_data is None:
+                if len(embed_track_ids) >= self._EMBED_TRACK_CAP:
+                    log.warning(
+                        "playlist %s may have more than the %d tracks the embed page lists, "
+                        "but spclient was unavailable; continuing with the partial list",
+                        playlist_id,
+                        len(embed_track_ids),
+                    )
                 return
-
-            spc_data = resp.json()
             total_tracks = spc_data.get("length", 0)
 
             if total_tracks <= len(embed_track_ids):
@@ -528,7 +584,9 @@ class SpotifyEmbedAPI:
                 pool.shutdown(wait=False, cancel_futures=True)
 
         except Exception:
-            pass  # spclient fallback failed, just return what we have
+            # spclient fallback failed, just return what we have, but say so:
+            # this is the difference between 100 tracks and the whole playlist
+            log.warning("spclient track fallback failed for %s", playlist_id, exc_info=True)
 
     def _parse_track(self, track: dict, track_id: str) -> TrackInfo:
         """Parse a track dict from embed trackList."""
@@ -741,62 +799,6 @@ class SpotifyEmbedAPI:
         if track_info is None:
             raise SpotifyDownAPIError(f"Could not fetch track {track_id}")
         return track_info
-
-
-# Legacy class kept for compatibility - redirects to embed API
-class SpotifyDownAPI:
-    """Legacy wrapper - spotifydown mirrors are dead.
-
-    This class is kept for API compatibility but now raises errors
-    since all spotifydown endpoints are non-functional.
-    """
-
-    def __init__(self, **kwargs) -> None:
-        pass
-
-    def get_playlist_metadata(self, playlist_id: str) -> PlaylistInfo:
-        raise SpotifyDownAPIError(
-            "spotifydown mirrors are no longer functional. Use SpotifyEmbedAPI instead."
-        )
-
-    def iter_playlist_tracks(self, playlist_id: str) -> Iterator[TrackInfo]:
-        raise SpotifyDownAPIError(
-            "spotifydown mirrors are no longer functional. Use SpotifyEmbedAPI instead."
-        )
-
-    def get_track_download_link(self, track_id: str) -> str | None:
-        raise SpotifyDownAPIError(
-            "spotifydown mirrors are no longer functional. "
-            "Use yt-dlp YouTube search for audio downloads."
-        )
-
-    def get_track_youtube_id(self, track_id: str) -> str | None:
-        raise SpotifyDownAPIError(
-            "spotifydown mirrors are no longer functional. "
-            "Use yt-dlp YouTube search for audio downloads."
-        )
-
-
-# Legacy class kept for compatibility - token endpoint is blocked
-class SpotifyPublicAPI:
-    """Legacy wrapper - Spotify's anonymous token endpoint is blocked.
-
-    This class is kept for API compatibility but now raises errors
-    since the /get_access_token endpoint returns 403.
-    """
-
-    def __init__(self, **kwargs) -> None:
-        pass
-
-    def get_playlist_metadata(self, playlist_id: str) -> PlaylistInfo:
-        raise SpotifyDownAPIError(
-            "Spotify's anonymous token endpoint is blocked. Use SpotifyEmbedAPI instead."
-        )
-
-    def iter_playlist_tracks(self, playlist_id: str) -> Iterator[TrackInfo]:
-        raise SpotifyDownAPIError(
-            "Spotify's anonymous token endpoint is blocked. Use SpotifyEmbedAPI instead."
-        )
 
 
 class PlaylistClient:
@@ -1040,10 +1042,8 @@ __all__ = [
     "PlaylistClient",
     "PlaylistInfo",
     "RateLimitError",
-    "SpotifyDownAPI",
     "SpotifyDownAPIError",
     "SpotifyEmbedAPI",
-    "SpotifyPublicAPI",
     "TrackInfo",
     "cap_filename",
     "detect_spotify_url_type",
