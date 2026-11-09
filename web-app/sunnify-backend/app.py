@@ -22,7 +22,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from spotifydown_api import (  # noqa: E402
+    ContentUnavailableError,
     PlaylistClient,
+    RateLimitError,
     SpotifyDownAPIError,
     SpotifyEmbedAPI,
     detect_spotify_url_type,
@@ -139,6 +141,14 @@ def scrape_playlist():
     except ValueError:
         # bad/unsupported spotify url is client input error, not a server fault
         return jsonify({"event": "error", "data": {"message": "Invalid Spotify URL"}}), 400
+    except ContentUnavailableError as exc:
+        # private/removed/region-locked: the message is already user-safe
+        return jsonify({"event": "error", "data": {"message": str(exc)}}), 404
+    except RateLimitError:
+        return (
+            jsonify({"event": "error", "data": {"message": "Spotify rate limit, retry soon"}}),
+            429,
+        )
     except SpotifyDownAPIError:
         # log the detail server-side; don't leak exception internals to the client
         app.logger.exception("spotify api error during scrape")
