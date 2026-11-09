@@ -43,11 +43,10 @@ from mutagen.easyid3 import EasyID3
 from mutagen.id3 import APIC, ID3
 from PyQt6.QtCore import (
     QEasingCurve,
-    QPropertyAnimation,
-    QSize,
     Qt,
     QThread,
     QTimer,
+    QVariantAnimation,
     pyqtSignal,
     pyqtSlot,
 )
@@ -313,6 +312,25 @@ SUPPORTED_FORMATS = {
 SUPPORTED_QUALITIES = ("128", "192", "256", "320")
 # "auto" keeps whatever rate the source stream has (YouTube audio is 48 kHz).
 SUPPORTED_SAMPLE_RATES = ("auto", "44100", "48000")
+# Whole-UI zoom in percent (#122). The window is fixed-pixel, so the only
+# faithful way to enlarge buttons *and* fonts together is Qt's global scale
+# factor, which is read once at startup (see apply_ui_scale).
+SUPPORTED_UI_SCALES = ("100", "125", "150", "175", "200")
+
+
+def apply_ui_scale(config: dict, environ=None) -> str | None:
+    """Export QT_SCALE_FACTOR from the saved ui_scale; call before QApplication.
+
+    An explicit QT_SCALE_FACTOR in the environment wins (power users and
+    kiosks already set it). Returns the factor applied, or None when 100%.
+    """
+    environ = os.environ if environ is None else environ
+    scale = config.get("ui_scale", "100")
+    if scale not in SUPPORTED_UI_SCALES or scale == "100" or "QT_SCALE_FACTOR" in environ:
+        return None
+    factor = f"{int(scale) / 100:g}"
+    environ["QT_SCALE_FACTOR"] = factor
+    return factor
 
 
 class _Setting:
@@ -401,6 +419,13 @@ SETTINGS = (
         scraper_kwarg="loose_match",
         cli_flag="--loose-match",
         help="fall back to the closest result when strict matching finds nothing",
+    ),
+    _Setting(
+        "ui_scale",
+        "100",
+        "choice",
+        SUPPORTED_UI_SCALES,
+        help="interface size in percent (100-200), applied on next launch",
     ),
     _Setting(
         "cookies_file",
@@ -806,6 +831,7 @@ class MusicScraper(QThread):
         self._manifest_lock = threading.Lock()
         self._manifest_path: str | None = None
         self._manifest_owners: dict[str, str] = {}
+        self._previous_failures: dict[str, str] = {}  # track id -> title, from the last run
         # youtube blocks per-IP, so it hits every track at once; say it once
         # rather than 300 times, and say what it actually means
         self._network_blocked = False
@@ -815,6 +841,7 @@ class MusicScraper(QThread):
         # that only makes sense for a single active download.
         self._parallel_mode = False
         self._total_tracks = 0
+        self._listing_shortfall = 0  # tracks Spotify reports but we couldn't list
 
     def is_cancelled(self) -> bool:
         """Check if cancellation has been requested."""
@@ -1349,23 +1376,6 @@ class MusicScraper(QThread):
         log.debug("no playable audio landed for query set %r", queries)
         raise RuntimeError("no playable audio source found on YouTube for this track")
 
-    def download_http_file(self, url, destination):
-        response = self.session.get(url, stream=True, timeout=60)
-        response.raise_for_status()
-        total = int(response.headers.get("content-length", 0))
-        downloaded = 0
-        os.makedirs(os.path.dirname(destination), exist_ok=True)
-        with open(destination, "wb") as handle:
-            for chunk in response.iter_content(chunk_size=8192):
-                if not chunk:
-                    continue
-                handle.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    progress = int(downloaded / total * 100)
-                    self.dlprogress_signal.emit(progress)
-        return destination
-
     def _download_one_track(self, track, playlist_folder_path, default_cover_url, track_num=0):
         """Download a single track. Runs inside a ThreadPoolExecutor worker.
 
@@ -1480,6 +1490,7 @@ class MusicScraper(QThread):
                 log.debug("track failure traceback for '%s'", track_title, exc_info=True)
                 with self._failed_lock:
                     self._failed_tracks.append(track_title)
+                self._record_failure(track.id, track_title)
                 self._finish_track_ui(ok=False)
                 return track_title
 
@@ -1491,6 +1502,7 @@ class MusicScraper(QThread):
                 )
                 with self._failed_lock:
                     self._failed_tracks.append(track_title)
+                self._record_failure(track.id, track_title)
                 self._finish_track_ui(ok=False)
                 return track_title
 
@@ -1528,6 +1540,7 @@ class MusicScraper(QThread):
         path = os.path.join(folder, MANIFEST_FILENAME)
         self._manifest_path = path
         self._manifest_owners = {}
+        self._previous_failures = {}
         done: set[str] = set()
         if not os.path.exists(path):
             return done
@@ -1541,14 +1554,41 @@ class MusicScraper(QThread):
                         record = json.loads(line)
                     except ValueError:
                         continue
+                    if not isinstance(record, dict):
+                        continue
                     track_id = record.get("id")
                     filename = record.get("file")
-                    if track_id and filename and os.path.exists(os.path.join(folder, filename)):
+                    if track_id and not filename and record.get("failed"):
+                        # a failure line: it supersedes an earlier success only
+                        # if it comes later (the file was removed, then the retry failed)
+                        self._previous_failures[track_id] = str(record["failed"])
+                        done.discard(track_id)
+                    elif track_id and filename and os.path.exists(os.path.join(folder, filename)):
                         done.add(track_id)
+                        self._previous_failures.pop(track_id, None)
                         self._manifest_owners[filename.casefold()] = track_id
         except OSError:
+            self._previous_failures = {}
             return set()
         return done
+
+    def _record_failure(self, track_id, title: str) -> None:
+        """Append a failed track so the next run can say it is retrying it.
+
+        Old versions skip lines without a "file" key, so the manifest stays
+        readable by them. Best-effort like _record_in_manifest.
+        """
+        if not track_id or not self._manifest_path:
+            return
+        import json
+
+        record = json.dumps({"id": track_id, "failed": title})
+        with self._manifest_lock:
+            try:
+                with open(self._manifest_path, "a", encoding="utf-8") as handle:
+                    handle.write(record + "\n")
+            except OSError:
+                pass
 
     def _file_belongs_to_other(self, filepath: str, track_id) -> bool:
         """True when a file already at this path is a different track's per
@@ -1649,6 +1689,34 @@ class MusicScraper(QThread):
                 self.PlaylistCompleted.emit("Download cancelled")
                 return
 
+            # Tell the user which tracks are being retried from the last run;
+            # only ones still in the playlist count (others were removed).
+            listed_ids = {t.id for t in tracks}
+            retrying = [
+                title for tid, title in self._previous_failures.items() if tid in listed_ids
+            ]
+            if retrying:
+                log.info("retrying %d track(s) that failed last run: %s", len(retrying), retrying)
+                self.error_signal.emit(f"Retrying {len(retrying)} track(s) that failed last time")
+
+            # Spotify's declared length vs what we could actually list. Local
+            # files, podcasts and unavailable items legitimately never appear,
+            # but a big gap usually means the track fallback failed, so the
+            # user should hear it instead of believing the playlist is whole.
+            listed = len(tracks) + len(already_done)
+            self._listing_shortfall = (
+                expected_total - listed
+                if isinstance(expected_total, int) and expected_total > listed
+                else 0
+            )
+            if self._listing_shortfall:
+                log.warning(
+                    "listed %d of %d tracks Spotify reports (%d missing)",
+                    listed,
+                    expected_total,
+                    self._listing_shortfall,
+                )
+
             self.Resetprogress_signal.emit(0)
 
             # Small playlists don't benefit from parallelism. Keep 1 worker for
@@ -1739,7 +1807,12 @@ class MusicScraper(QThread):
                 self.PlaylistCompleted.emit(f"Done! {len(self._failed_tracks)} track(s) failed")
             else:
                 log.info("scrape done: %d ok, 0 failed", self._total_tracks)
-                self.PlaylistCompleted.emit("Download Complete!")
+                note = (
+                    f" ({self._listing_shortfall} track(s) Spotify lists could not be fetched)"
+                    if self._listing_shortfall
+                    else ""
+                )
+                self.PlaylistCompleted.emit(f"Download Complete!{note}")
 
     def returnSPOT_ID(self, link):
         """Extract playlist ID from Spotify URL."""
@@ -1805,8 +1878,15 @@ class MusicScraper(QThread):
         search_query = f"ytsearch1:{track_title} {artists} audio"
         expected_dur = (track.duration_ms / 1000) if track.duration_ms else None
         try:
+            # title/artists must travel with the query: without them the matcher
+            # takes its legacy "trust the top hit" path and the wrong-audio
+            # safeguard (#52) and the loose-match setting never apply to singles
             final_path = self.download_track_audio(
-                search_query, filepath, expected_duration_s=expected_dur
+                search_query,
+                filepath,
+                expected_duration_s=expected_dur,
+                expected_title=track_title,
+                expected_artists=artists,
             )
         except Exception as error_status:
             error_msg = self._get_user_friendly_error(error_status, track_title)
@@ -2147,6 +2227,14 @@ class SettingsDialog(QDialog):
         self._loose_match_cb = QCheckBox()
         self._loose_match_cb.setChecked(self._config.get("loose_match", False))
 
+        self._ui_scale_cb = QComboBox()
+        for value in SUPPORTED_UI_SCALES:
+            self._ui_scale_cb.addItem(f"{value}%")
+        current_scale = self._config.get("ui_scale", "100")
+        if current_scale not in SUPPORTED_UI_SCALES:
+            current_scale = "100"
+        self._ui_scale_cb.setCurrentText(f"{current_scale}%")
+
         # initial enable/disable sync needs every dependent combo to exist
         self._on_format_change(self._format_cb.currentText())
         self._update_filename_preview()
@@ -2210,6 +2298,13 @@ class SettingsDialog(QDialog):
                 "On: falls back to the closest result by length, which recovers "
                 "songs whose YouTube title is in another script (Greek, Cyrillic, "
                 "Korean) but may let an occasional cover or remix slip through.",
+            ),
+            (
+                "Interface size:",
+                self._ui_scale_cb,
+                "Enlarges the whole window, buttons and text together. "
+                "Takes effect the next time Sunnify starts. If the window ends up "
+                "bigger than your screen, set it back with: sunnify config --set ui_scale=100",
             ),
         ]
         _fm = QFontMetrics(self.font())
@@ -2365,6 +2460,7 @@ class SettingsDialog(QDialog):
         label_to_value = {v: k for k, v in self._sample_rate_labels.items()}
         self._config["sample_rate"] = label_to_value.get(self._sample_rate_cb.currentText(), "auto")
         self._config["loose_match"] = self._loose_match_cb.isChecked()
+        self._config["ui_scale"] = self._ui_scale_cb.currentText().rstrip("%")
         return self._config
 
 
@@ -2631,13 +2727,15 @@ class StarPromptNotifier(QDialog):
 
 # Main Window
 class MainWindow(QMainWindow, Ui_MainWindow):
+    MIN_WINDOW_SIZE = (420, 440)
+
     def __init__(self):
         """MainWindow constructor"""
         super().__init__()
-        self.setupUi(self)
-        # let the options row size to its content so "Add Meta Tags" isn't clipped
-        # by the .ui's fixed-width container (varies with font/locale/dpi)
-        self.horizontalLayoutWidget_5.adjustSize()
+        self.setupUi(self)  # layout-based, so rows size to their content (font/locale/dpi)
+        # Qt's own minimum ignores word-wrapped heights, so a long status line
+        # would clip at the layout's bare minimum; this floor keeps it readable.
+        self.setMinimumSize(*self.MIN_WINDOW_SIZE)
 
         # Load persisted user config so format/quality/folder survive restarts
         self._config = load_config()
@@ -2775,10 +2873,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             if new.get("download_path"):
                 self.download_path = new["download_path"]
                 self._download_path_set = True
+            old_scale = self._config.get("ui_scale", "100")
             self._config.update({s.key: s.coerce(new.get(s.key, s.default)) for s in SETTINGS})
             self._config["download_path"] = self.download_path
             save_config(self._config)
-            self.statusMsg.setText("Settings saved")
+            if self._config.get("ui_scale", "100") != old_scale:
+                self.statusMsg.setText("Settings saved - restart Sunnify to apply the new size")
+            else:
+                self.statusMsg.setText("Settings saved")
 
     @pyqtSlot()
     def on_returnButton(self):
@@ -3059,30 +3161,40 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
 
     def mouseMoveEvent(self, QMouseEvent):
-        try:
-            if Qt.MouseButton.LeftButton and self.m_drag:
-                self.move(QMouseEvent.globalPosition().toPoint() - self.m_DragPosition)
-                QMouseEvent.accept()
-        except AttributeError:
-            pass
+        # m_drag only exists after a left press; checking the button state too
+        # keeps a stale flag from dragging the window on hover
+        if getattr(self, "m_drag", False) and (
+            QMouseEvent.buttons() & Qt.MouseButton.LeftButton
+        ):
+            self.move(QMouseEvent.globalPosition().toPoint() - self.m_DragPosition)
+            QMouseEvent.accept()
 
     def mouseReleaseEvent(self, QMouseEvent):
         self.m_drag = False
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
 
+    # The preview panel sits in the window's layout, so its width is animated
+    # (fixed width, not geometry) and the layout moves the card to make room.
+    PREVIEW_WIDTH = 350
+
+    def _animate_preview(self, target: int, duration_ms: int) -> None:
+        previous = getattr(self, "animation", None)
+        if previous is not None:
+            previous.stop()
+        anim = QVariantAnimation(self)
+        anim.setDuration(duration_ms)
+        anim.setStartValue(self.SONGINFORMATION.width())
+        anim.setEndValue(target)
+        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        anim.valueChanged.connect(lambda w: self.SONGINFORMATION.setFixedWidth(int(w)))
+        self.animation = anim
+        anim.start()
+
     def CloseSongInformation(self):
-        self.animation = QPropertyAnimation(self.SONGINFORMATION, b"size")
-        self.animation.setDuration(250)
-        self.animation.setEndValue(QSize(0, 440))
-        self.animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
-        self.animation.start()
+        self._animate_preview(0, 250)
 
     def OpenSongInformation(self):
-        self.animation = QPropertyAnimation(self.SONGINFORMATION, b"size")
-        self.animation.setDuration(1000)
-        self.animation.setEndValue(QSize(350, 440))
-        self.animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
-        self.animation.start()
+        self._animate_preview(self.PREVIEW_WIDTH, 1000)
 
     def show_preview(self, state):
         if state == 2:  # 2 corresponds to checked state
@@ -3153,6 +3265,11 @@ if __name__ == "__main__":
         )
     except Exception as exc:  # log so a scaling failure (rendering bugs) is diagnosable
         log.debug("high-dpi setup skipped: %s", exc)
+    # QT_SCALE_FACTOR is only read at QApplication construction (#122)
+    with contextlib.suppress(Exception):
+        applied = apply_ui_scale(load_config())
+        if applied:
+            log.info("ui scale: %s", applied)
     app = QApplication(sys.argv)
     # wake python every 200ms during exec() so a pending signal's handler runs
     # promptly (qt's c++ loop otherwise defers python signals until a qt slot)
@@ -3160,8 +3277,10 @@ if __name__ == "__main__":
     _signal_waker.start(200)
     _signal_waker.timeout.connect(lambda: None)
     Screen = MainWindow()
-    Screen.setFixedHeight(500)
-    Screen.setFixedWidth(750)
+    # resizable (#122): the layouts set the minimum, the size grip in the card's
+    # corner drags it. Open at the classic 750x500, clamped to small screens.
+    _avail = app.primaryScreen().availableGeometry()
+    Screen.resize(min(750, int(_avail.width() * 0.95)), min(500, int(_avail.height() * 0.95)))
     Screen.setWindowFlags(Qt.WindowType.FramelessWindowHint)
     Screen.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     Screen.show()

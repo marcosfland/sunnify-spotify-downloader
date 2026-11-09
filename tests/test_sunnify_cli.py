@@ -322,3 +322,28 @@ class TestBinaryDispatch:
         result = self._run("help", "download")
         assert result.returncode == 0
         assert "usage: sunnify download" in result.stdout
+
+
+class TestUiScale:
+    """#122: whole-UI zoom is exported as QT_SCALE_FACTOR before QApplication."""
+
+    def test_applies_saved_scale(self):
+        env: dict = {}
+        assert sd.apply_ui_scale({"ui_scale": "150"}, env) == "1.5"
+        assert env["QT_SCALE_FACTOR"] == "1.5"
+
+    def test_default_and_invalid_leave_env_alone(self):
+        for cfg in ({}, {"ui_scale": "100"}, {"ui_scale": "999"}, {"ui_scale": None}):
+            env: dict = {}
+            assert sd.apply_ui_scale(cfg, env) is None
+            assert "QT_SCALE_FACTOR" not in env
+
+    def test_explicit_env_wins(self):
+        env = {"QT_SCALE_FACTOR": "2"}
+        assert sd.apply_ui_scale({"ui_scale": "125"}, env) is None
+        assert env["QT_SCALE_FACTOR"] == "2"
+
+    def test_setting_is_validated_by_registry(self):
+        s = next(x for x in sd.SETTINGS if x.key == "ui_scale")
+        assert s.coerce("175") == "175"
+        assert s.coerce("3000") == s.default

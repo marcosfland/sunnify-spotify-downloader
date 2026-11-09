@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **resizable desktop window (#122).** the main window is now layout-based instead of fixed-pixel: drag the grip in the card's bottom-right corner to resize it, and long status lines wrap rather than clip. the song-preview panel now makes room beside the card instead of overlapping it. `Template.py` stays hand-maintained (see 2.x notes), and every widget keeps its name.
+- **interface size setting (#122).** Settings has a new "Interface size" (100% to 200%), also reachable as `sunnify config --set ui_scale=150`. it scales buttons and text together and applies on the next launch; an explicit `QT_SCALE_FACTOR` in the environment still wins.
+- **failed tracks are remembered between runs.** the playlist manifest now records tracks that failed, and a resume says `Retrying N track(s) that failed last time`. older versions skip those lines.
+- **incomplete playlist listings are reported.** when Spotify reports more tracks than could be listed, the final message says how many are missing instead of claiming a clean finish.
+
+### Fixed
+- **single-track downloads skipped the wrong-audio safeguard (#52).** `scrape_track` never passed the title and artists to the matcher, so it trusted YouTube's top hit and ignored the loose-match setting. it now matches like playlist downloads do.
+- **large playlists could silently stop at 100 tracks.** the spclient fallback never refreshed its access token, hid every failure, and treated an unknown expiry as already expired. it now refreshes an expired token, retries once on a 401, and logs the reason when it still can't reach spclient.
+- **the window could drag on hover.** the mouse-move handler tested `Qt.MouseButton.LeftButton and self.m_drag`, whose first operand is always true; it now checks the pressed buttons.
+- **web backend errors were all HTTP 500.** an unavailable item now answers 404 with the reason and a Spotify rate limit answers 429.
+
+### Removed
+- the unused `SpotifyDownAPI` and `SpotifyPublicAPI` legacy stubs and `MusicScraper.download_http_file`.
+
 ## [2.6.0] - 2026-11-01
 
 ### Added

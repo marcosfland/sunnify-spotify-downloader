@@ -4148,3 +4148,220 @@ class TestFfmpegPreflight:
             monkeypatch.setattr(sys, "platform", platform)
             with pytest.raises(RuntimeError, match=needle):
                 MusicScraper().download_track_audio("ytsearch1:x", "/tmp/none.mp3")
+
+
+class TestSingleTrackMatchGuard:
+    """scrape_track must pass title/artists so the wrong-audio safeguard (#52)
+    and loose_match apply to single tracks, not just playlists."""
+
+    def test_title_and_artists_reach_the_matcher(self, tmp_path):
+        helper = TestSingleTrackFailureAccounting()
+        s = helper._scraper()
+        seen = {}
+
+        def capture(*_a, **kw):
+            seen.update(kw)
+            raise RuntimeError("stop")
+
+        s.download_track_audio = capture
+        s.scrape_track(helper.URL, str(tmp_path))
+        assert seen["expected_title"] == "T"
+        assert seen["expected_artists"] == "A"
+
+
+class TestListingShortfallNotice:
+    """When Spotify reports more tracks than we could list, say so."""
+
+    def _run(self, tmp_path, reported, listed):
+        from Spotify_Downloader import MusicScraper
+        from spotifydown_api import PlaylistInfo, TrackInfo
+
+        s = MusicScraper()
+        for sig in (
+            "song_meta", "add_song_meta", "dlprogress_signal", "Resetprogress_signal",
+            "PlaylistID", "song_Album", "PlaylistCompleted", "error_signal",
+            "count_updated", "resume_skipped",
+        ):  # fmt: skip
+            setattr(s, sig, MagicMock())
+        api = MagicMock()
+        api.get_playlist_metadata.return_value = PlaylistInfo(
+            name="PL", owner="me", description=None, cover_url=None, track_count=reported
+        )
+        api.iter_playlist_tracks.return_value = iter(
+            TrackInfo(
+                id=f"t{i}", title=f"T{i}", artists="A", album=None, release_date=None,
+                cover_url=None, duration_ms=1000, preview_url=None, raw={},
+            )
+            for i in range(listed)
+        )  # fmt: skip
+        s.ensure_spotifydown_api = lambda: api
+        s.spotifydown_api = api
+        s._download_one_track = lambda *_a, **_k: None
+        s.scrape_playlist("https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M", str(tmp_path))
+        return s
+
+    def test_shortfall_is_reported_on_completion(self, tmp_path):
+        s = self._run(tmp_path, reported=150, listed=100)
+        assert s._listing_shortfall == 50
+        msg = s.PlaylistCompleted.emit.call_args[0][0]
+        assert msg.startswith("Download Complete!") and "50 track(s)" in msg
+
+    def test_resume_announces_tracks_that_failed_last_time(self, tmp_path):
+        import json
+
+        folder = tmp_path / "PL - me"
+        folder.mkdir()
+        (folder / ".sunnify-manifest.jsonl").write_text(
+            "\n".join(
+                json.dumps(r)
+                for r in ({"id": "t1", "failed": "T1"}, {"id": "gone", "failed": "Removed"})
+            )
+            + "\n"
+        )
+        s = self._run(tmp_path, reported=3, listed=3)
+        msgs = [c[0][0] for c in s.error_signal.emit.call_args_list]
+        assert "Retrying 1 track(s) that failed last time" in msgs
+
+    def test_complete_listing_has_no_note(self, tmp_path):
+        s = self._run(tmp_path, reported=5, listed=5)
+        assert s._listing_shortfall == 0
+        assert s.PlaylistCompleted.emit.call_args[0][0] == "Download Complete!"
+
+
+class TestFailureMemoryAcrossRuns:
+    """The manifest also remembers failed tracks so a resume can say it is
+    retrying them; success lines and old readers are unaffected."""
+
+    def _scraper(self):
+        from Spotify_Downloader import MusicScraper
+
+        return MusicScraper()
+
+    def test_failure_is_remembered_but_not_counted_as_done(self, tmp_path):
+        w = self._scraper()
+        w._load_manifest(str(tmp_path))
+        w._record_failure("bad", "Bad Song")
+        r = self._scraper()
+        assert r._load_manifest(str(tmp_path)) == set()
+        assert r._previous_failures == {"bad": "Bad Song"}
+
+    def test_later_success_clears_the_failure(self, tmp_path):
+        w = self._scraper()
+        w._load_manifest(str(tmp_path))
+        w._record_failure("t", "Song")
+        (tmp_path / "Song.mp3").write_bytes(b"x")
+        w._record_in_manifest("t", str(tmp_path / "Song.mp3"))
+        r = self._scraper()
+        assert r._load_manifest(str(tmp_path)) == {"t"}
+        assert r._previous_failures == {}
+
+    def test_failure_after_success_wins(self, tmp_path):
+        """File deleted, retry failed: it must be retried, not skipped."""
+        w = self._scraper()
+        w._load_manifest(str(tmp_path))
+        (tmp_path / "Song.mp3").write_bytes(b"x")
+        w._record_in_manifest("t", str(tmp_path / "Song.mp3"))
+        w._record_failure("t", "Song")
+        r = self._scraper()
+        assert r._load_manifest(str(tmp_path)) == set()
+        assert r._previous_failures == {"t": "Song"}
+
+    def test_failure_lines_are_invisible_to_the_old_reader_shape(self, tmp_path):
+        """Old versions require a "file" key; a failure line has none."""
+        import json
+
+        w = self._scraper()
+        w._load_manifest(str(tmp_path))
+        w._record_failure("t", "Song")
+        line = json.loads((tmp_path / ".sunnify-manifest.jsonl").read_text().strip())
+        assert "file" not in line and line["id"] == "t"
+
+    def test_non_dict_lines_do_not_crash_loading(self, tmp_path):
+        (tmp_path / ".sunnify-manifest.jsonl").write_text('[1,2]\n"x"\n{"id":"a","failed":"A"}\n')
+        r = self._scraper()
+        assert r._load_manifest(str(tmp_path)) == set()
+        assert r._previous_failures == {"a": "A"}
+
+
+class TestResizableWindow:
+    """#122: the main window is layout-based and resizable, not fixed-pixel."""
+
+    @pytest.fixture(autouse=True)
+    def _no_update_thread(self, monkeypatch):
+        import Spotify_Downloader as sd
+
+        monkeypatch.setattr(sd.UpdateCheckThread, "start", lambda _self: None)
+
+    def _win(self):
+        import Spotify_Downloader as sd
+
+        win = sd.MainWindow()
+        win.show()
+        return win
+
+    def test_window_is_not_fixed_size(self, qapp):
+        win = self._win()
+        assert win.minimumWidth() < win.maximumWidth()
+        assert win.minimumHeight() < win.maximumHeight()
+        win.resize(1000, 700)
+        qapp.processEvents()
+        assert (win.width(), win.height()) == (1000, 700)
+
+    def test_card_grows_with_the_window(self, qapp):
+        win = self._win()
+        win.resize(750, 500)
+        qapp.processEvents()
+        before = win.frame.width()
+        win.resize(1000, 500)
+        qapp.processEvents()
+        assert win.frame.width() > before
+
+    def test_cannot_shrink_below_the_floor(self, qapp):
+        import Spotify_Downloader as sd
+
+        win = self._win()
+        win.resize(100, 100)
+        qapp.processEvents()
+        assert win.width() >= sd.MainWindow.MIN_WINDOW_SIZE[0]
+        assert win.height() >= sd.MainWindow.MIN_WINDOW_SIZE[1]
+
+    def test_long_status_never_widens_the_window(self, qapp):
+        win = self._win()
+        win.resize(750, 500)
+        qapp.processEvents()
+        win.statusMsg.setText("YouTube is asking this network to prove it isn't a bot. " * 6)
+        win.CounterLabel.setText("Songs downloaded 123 of 456 (78 failed) " * 4)
+        qapp.processEvents()
+        assert win.width() == 750
+
+    def test_every_widget_the_app_uses_still_exists(self, qapp):
+        win = self._win()
+        for name in (
+            "frame", "title", "Closed", "SettingsBtn", "PlaylistLink", "DownloadBtn",
+            "AlbumName", "MainSongName", "statusMsg", "CounterLabel", "showPreviewCheck",
+            "AddMetaDataCheck", "SongDownloadprogress", "SongDownloadprogressBar",
+            "SONGINFORMATION", "CoverImg", "SongName", "YearText", "ArtistNameText",
+            "AlbumText", "label_8", "Select_Home", "sizeGrip",
+        ):  # fmt: skip
+            assert getattr(win, name) is not None, name
+
+    def test_preview_panel_starts_closed_and_opens_by_width(self, qapp):
+        win = self._win()
+        assert win.SONGINFORMATION.width() == 0
+        win.OpenSongInformation()
+        win.animation.setCurrentTime(win.animation.duration())
+        qapp.processEvents()
+        assert win.SONGINFORMATION.width() == win.PREVIEW_WIDTH
+        win.CloseSongInformation()
+        win.animation.setCurrentTime(win.animation.duration())
+        qapp.processEvents()
+        assert win.SONGINFORMATION.width() == 0
+
+    def test_opening_preview_makes_room_instead_of_overlapping(self, qapp):
+        win = self._win()
+        win.resize(900, 500)
+        qapp.processEvents()
+        win.OpenSongInformation()
+        win.animation.setCurrentTime(win.animation.duration())
+        qapp.processEvents()
+        assert win.frame.geometry().right() <= win.SONGINFORMATION.geometry().left()
